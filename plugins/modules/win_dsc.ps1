@@ -138,6 +138,39 @@ Function Add-PropertyOption {
     $Spec.options.$property_name = $option
 }
 
+Function ConvertTo-OptionSpec {
+    <#
+    .SYNOPSIS
+    Converts the properties spec of a class-based DSC resource into Ansible option spec
+    #>
+
+    param(
+        [Parameter(Mandatory = $true)][Object]$Properties
+    )
+
+    $spec = @{
+        options = @{}
+    }
+
+    foreach ($property in $properties) {
+        $prop = switch ($property.PropertyType) {
+            [string] { @{ type = "str" } }
+            [bool] { @{type = "bool" } }
+            [string[]] { @{type = "list"; elements = "str" } }
+            default { @{ type = "raw" } }
+        }
+        if ($property.IsMandatory) {
+            $prop.required = $true
+        }
+        if ($property.Values) {
+            $prop.choices = $property.Values
+        }
+        $spec.options.Add($property.Name, $prop)
+    }
+
+    return $spec
+}
+
 Function Get-OptionSpec {
     <#
     .SYNOPSIS
@@ -443,6 +476,13 @@ if (-not $resource) {
     Write-AnsibleError -Msg $msg
 }
 
+if (($resource.ImplementationDetail -eq 'ClassBased') -or ($resource.Module)) {
+    $is_classbased_resource = $true
+}
+else {
+    $is_classbased_resource = $false
+}
+
 # DSC Composite resources are currently not supported without a MOF file
 # this check prevents the user from getting a "Failed to serialize properties into CimInstance." error and
 # instead gets something a bit more informative while support is being worked on.
@@ -476,8 +516,13 @@ $get_args.Method = 'Get'
 $get_args.Property = @{ Fake = 'Fake' }
 $null = Invoke-SafeDscResource -Parameters $get_args -ErrorAction SilentlyContinue
 
-# Dynamically build the option spec based on the resource_name specified and create the module object
-$spec = Get-OptionSpec -ClassName $resource.ResourceType
+if ($is_classbased_resource) {
+    $spec = ConvertTo-OptionSpec -Properties $resource.Properties
+}
+else {
+    # Dynamically build the option spec based on the resource_name specified and create the module object
+    $spec = Get-OptionSpec -ClassName $resource.ResourceType
+}
 $spec.supports_check_mode = $true
 $spec.options.module_version = @{ type = "str"; default = "latest" }
 $spec.options.resource_name = @{ type = "str"; required = $true }
@@ -487,7 +532,18 @@ $module.Result.reboot_required = $false
 $module.Result.module_version = $module_version
 
 # Build the DSC invocation arguments and invoke the resource
-$dsc_args.Property = ConvertTo-DscProperty -ClassName $resource.ResourceType -Module $module -Params $Module.Params
+if ($is_classbased_resource) {
+    $property_hash = @{}
+    foreach ($p in $resource.Properties) {
+        if ($null -ne $module.Params.($p.Name)) {
+            $property_hash[$p.Name] = $module.Params.($p.Name)
+        }
+    }
+    $dsc_args.Property = $property_hash
+}
+else {
+    $dsc_args.Property = ConvertTo-DscProperty -ClassName $resource.ResourceType -Module $module -Params $Module.Params
+}
 $dsc_args.Verbose = $true
 
 $test_result = Invoke-DscMethod -Module $module -Method Test -Arguments $dsc_args
